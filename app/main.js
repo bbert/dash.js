@@ -55,7 +55,7 @@ app.directive('chart', function() {
                     },
                     yaxis: {
                         min: 0,
-                        max: 15
+                        max: 60
                     },
                     xaxis: {
                         show: false
@@ -98,8 +98,7 @@ app.controller('DashController', function($scope, Sources, Notes, Contributors, 
         context,
         videoSeries = [],
         audioSeries = [],
-        maxGraphPoints = 50,
-        updateInterval = 333;
+        maxGraphPoints = 50;
 
     ////////////////////////////////////////
     //
@@ -113,6 +112,12 @@ app.controller('DashController', function($scope, Sources, Notes, Contributors, 
     $scope.videoMaxIndex = 0;
     $scope.videoBufferLength = 0;
     $scope.videoDroppedFrames = 0;
+    $scope.videoLatencyCount = 0;
+    $scope.videoLatency = "";
+    $scope.videoDownloadCount = 0;
+    $scope.videoDownload = "";
+    $scope.videoRatioCount = 0;
+    $scope.videoRatio = "";
 
     $scope.audioBitrate = 0;
     $scope.audioIndex = 0;
@@ -120,6 +125,12 @@ app.controller('DashController', function($scope, Sources, Notes, Contributors, 
     $scope.audioMaxIndex = 0;
     $scope.audioBufferLength = 0;
     $scope.audioDroppedFrames = 0;
+    $scope.videoLatencyCount = 0;
+    $scope.audioLatency = "";
+    $scope.audioDownloadCount = 0;
+    $scope.audioDownload = "";
+    $scope.audioRatioCount = 0;
+    $scope.audioRatio = "";
 
     var converter = new MetricsTreeConverter();
     $scope.videoMetrics = null;
@@ -135,12 +146,21 @@ app.controller('DashController', function($scope, Sources, Notes, Contributors, 
         $scope.audioMetrics = converter.toTreeViewDataSource(metrics);
     }
 
+    // from: https://gist.github.com/siongui/4969449
+    $scope.safeApply = function(fn) {
+      var phase = this.$root.$$phase;
+      if(phase == '$apply' || phase == '$digest')
+        this.$eval(fn);
+      else
+        this.$apply(fn);
+    };
+
     function getCribbedMetricsFor(type) {
         var metrics = player.getMetricsFor(type),
             metricsExt = player.getMetricsExt(),
             repSwitch,
             bufferLevel,
-            httpRequest,
+            httpRequests,
             droppedFramesMetrics,
             bitrateIndexValue,
             bandwidthValue,
@@ -148,15 +168,59 @@ app.controller('DashController', function($scope, Sources, Notes, Contributors, 
             numBitratesValue,
             bufferLengthValue = 0,
             point,
-            lastFragmentDuration,
-            lastFragmentDownloadTime,
-            droppedFramesValue = 0;
+            movingLatency = {},
+            movingDownload = {},
+            movingRatio = {},
+            droppedFramesValue = 0,
+            fillmoving = function(type, Requests){
+                var requestWindow,
+                    downloadTimes,
+                    latencyTimes,
+                    durationTimes;
+
+                requestWindow = Requests
+                    .slice(-20)
+                    .filter(function(req){return req.responsecode >= 200 && req.responsecode < 300 && !!req.mediaduration && req.type === "Media Segment" && req.stream === type;})
+                    .slice(-4);
+                if (requestWindow.length > 0) {
+
+                    latencyTimes = requestWindow.map(function (req){ return Math.abs(req.tresponse.getTime() - req.trequest.getTime()) / 1000;});
+
+                    movingLatency[type] = {
+                        average: latencyTimes.reduce(function(l, r) {return l + r;}) / latencyTimes.length, 
+                        high: latencyTimes.reduce(function(l, r) {return l < r ? r : l;}), 
+                        low: latencyTimes.reduce(function(l, r) {return l < r ? l : r;}), 
+                        count: latencyTimes.length
+                    };
+
+                    downloadTimes = requestWindow.map(function (req){ return Math.abs(req.tfinish.getTime() - req.tresponse.getTime()) / 1000;});
+
+                    movingDownload[type] = {
+                        average: downloadTimes.reduce(function(l, r) {return l + r;}) / downloadTimes.length, 
+                        high: downloadTimes.reduce(function(l, r) {return l < r ? r : l;}), 
+                        low: downloadTimes.reduce(function(l, r) {return l < r ? l : r;}), 
+                        count: downloadTimes.length
+                    };
+
+                    durationTimes = requestWindow.map(function (req){ return req.mediaduration;});
+
+                    movingRatio[type] = {
+                        average: (durationTimes.reduce(function(l, r) {return l + r;}) / downloadTimes.length) / movingDownload[type].average, 
+                        high: durationTimes.reduce(function(l, r) {return l < r ? r : l;}) / movingDownload[type].low, 
+                        low: durationTimes.reduce(function(l, r) {return l < r ? l : r;}) / movingDownload[type].high, 
+                        count: durationTimes.length
+                    };
+                }
+            };
 
         if (metrics && metricsExt) {
             repSwitch = metricsExt.getCurrentRepresentationSwitch(metrics);
             bufferLevel = metricsExt.getCurrentBufferLevel(metrics);
-            httpRequest = metricsExt.getCurrentHttpRequest(metrics);
+            httpRequests = metricsExt.getHttpRequests(metrics);
             droppedFramesMetrics = metricsExt.getCurrentDroppedFrames(metrics);
+
+            fillmoving("video", httpRequests);
+            fillmoving("audio", httpRequests);
 
             if (repSwitch !== null) {
                 bitrateIndexValue = metricsExt.getIndexForRepresentation(repSwitch.to);
@@ -169,15 +233,6 @@ app.controller('DashController', function($scope, Sources, Notes, Contributors, 
 
             if (bufferLevel !== null) {
                 bufferLengthValue = bufferLevel.level.toPrecision(5);
-            }
-
-            if (httpRequest !== null) {
-                lastFragmentDuration = httpRequest.mediaduration;
-                lastFragmentDownloadTime = httpRequest.tresponse.getTime() - httpRequest.trequest.getTime();
-
-                // convert milliseconds to seconds
-                lastFragmentDownloadTime = lastFragmentDownloadTime / 1000;
-                lastFragmentDuration = lastFragmentDuration.toPrecision(4);
             }
 
             if (droppedFramesMetrics !== null) {
@@ -208,7 +263,10 @@ app.controller('DashController', function($scope, Sources, Notes, Contributors, 
                 pendingIndex: (pendingValue !== bitrateIndexValue) ? "(-> " + (pendingValue + 1) + ")" : "",
                 numBitratesValue: numBitratesValue,
                 bufferLengthValue: bufferLengthValue,
-                droppedFramesValue: droppedFramesValue
+                droppedFramesValue: droppedFramesValue,
+                movingLatency: movingLatency,
+                movingDownload: movingDownload,
+                movingRatio: movingRatio
             }
         }
         else {
@@ -216,49 +274,75 @@ app.controller('DashController', function($scope, Sources, Notes, Contributors, 
         }
     }
 
-    function update() {
+    function metricChanged(e) {
         var metrics,
             point,
             treeData;
 
-        metrics = getCribbedMetricsFor("video");
-        if (metrics) {
-            $scope.videoBitrate = metrics.bandwidthValue;
-            $scope.videoIndex = metrics.bitrateIndexValue;
-            $scope.videoPendingIndex = metrics.pendingIndex;
-            $scope.videoMaxIndex = metrics.numBitratesValue;
-            $scope.videoBufferLength = metrics.bufferLengthValue;
-            $scope.videoDroppedFrames = metrics.droppedFramesValue;
+        if (e.data.stream == "video") {
+            metrics = getCribbedMetricsFor("video");
+            if (metrics) {
+                $scope.videoBitrate = metrics.bandwidthValue;
+                $scope.videoIndex = metrics.bitrateIndexValue;
+                $scope.videoPendingIndex = metrics.pendingIndex;
+                $scope.videoMaxIndex = metrics.numBitratesValue;
+                $scope.videoBufferLength = metrics.bufferLengthValue;
+                $scope.videoDroppedFrames = metrics.droppedFramesValue;
+                if (metrics.movingLatency["video"]) {
+                    $scope.videoLatencyCount = metrics.movingLatency["video"].count;
+                    $scope.videoLatency = metrics.movingLatency["video"].low.toFixed(3) + " < " + metrics.movingLatency["video"].average.toFixed(3) + " < " + metrics.movingLatency["video"].high.toFixed(3);
+                }
+                if (metrics.movingDownload["video"]) {
+                    $scope.videoDownloadCount = metrics.movingDownload["video"].count;
+                    $scope.videoDownload = metrics.movingDownload["video"].low.toFixed(3) + " < " + metrics.movingDownload["video"].average.toFixed(3) + " < " + metrics.movingDownload["video"].high.toFixed(3);
+                }
+                if (metrics.movingRatio["video"]) {
+                    $scope.videoRatioCount = metrics.movingRatio["video"].count;
+                    $scope.videoRatio = metrics.movingRatio["video"].low.toFixed(3) + " < " + metrics.movingRatio["video"].average.toFixed(3) + " < " + metrics.movingRatio["video"].high.toFixed(3);
+                }
 
-            point = [parseFloat(video.currentTime), Math.round(parseFloat(metrics.bufferLengthValue))];
-            videoSeries.push(point);
+                point = [parseFloat(video.currentTime), Math.round(parseFloat(metrics.bufferLengthValue))];
+                videoSeries.push(point);
 
-            if (videoSeries.length > maxGraphPoints) {
-                videoSeries.splice(0, 1);
+                if (videoSeries.length > maxGraphPoints) {
+                    videoSeries.splice(0, 1);
+                }
             }
         }
 
-        metrics = getCribbedMetricsFor("audio");
-        if (metrics) {
-            $scope.audioBitrate = metrics.bandwidthValue;
-            $scope.audioIndex = metrics.bitrateIndexValue;
-            $scope.audioPendingIndex = metrics.pendingIndex;
-            $scope.audioMaxIndex = metrics.numBitratesValue;
-            $scope.audioBufferLength = metrics.bufferLengthValue;
-            $scope.audioDroppedFrames = metrics.droppedFramesValue;
+        if (e.data.stream == "audio") {
+            metrics = getCribbedMetricsFor("audio");
+            if (metrics) {
+                $scope.audioBitrate = metrics.bandwidthValue;
+                $scope.audioIndex = metrics.bitrateIndexValue;
+                $scope.audioPendingIndex = metrics.pendingIndex;
+                $scope.audioMaxIndex = metrics.numBitratesValue;
+                $scope.audioBufferLength = metrics.bufferLengthValue;
+                $scope.audioDroppedFrames = metrics.droppedFramesValue;
+                if (metrics.movingLatency["audio"]) {
+                    $scope.audioLatencyCount = metrics.movingLatency["audio"].count;
+                    $scope.audioLatency = metrics.movingLatency["audio"].low.toFixed(3) + " < " + metrics.movingLatency["audio"].average.toFixed(3) + " < " + metrics.movingLatency["audio"].high.toFixed(3);
+                }
+                if (metrics.movingDownload["audio"]) {
+                    $scope.audioDownloadCount = metrics.movingDownload["audio"].count;
+                    $scope.audioDownload = metrics.movingDownload["audio"].low.toFixed(3) + " < " + metrics.movingDownload["audio"].average.toFixed(3) + " < " + metrics.movingDownload["audio"].high.toFixed(3);
+                }
+                if (metrics.movingRatio["audio"]) {
+                    $scope.audioRatioCount = metrics.movingRatio["audio"].count;
+                    $scope.audioRatio = metrics.movingRatio["audio"].low.toFixed(3) + " < " + metrics.movingRatio["audio"].average.toFixed(3) + " < " + metrics.movingRatio["audio"].high.toFixed(3);
+                }
 
-            point = [parseFloat(video.currentTime), Math.round(parseFloat(metrics.bufferLengthValue))];
-            audioSeries.push(point);
+                point = [parseFloat(video.currentTime), Math.round(parseFloat(metrics.bufferLengthValue))];
+                audioSeries.push(point);
 
-            if (audioSeries.length > maxGraphPoints) {
-                audioSeries.splice(0, 1);
+                if (audioSeries.length > maxGraphPoints) {
+                    audioSeries.splice(0, 1);
+                }
             }
         }
 
         $scope.invalidateDisplay(true);
-        $scope.$apply();
-
-        setTimeout(update, updateInterval);
+        $scope.safeApply();
     }
 
     ////////////////////////////////////////
@@ -319,6 +403,7 @@ app.controller('DashController', function($scope, Sources, Notes, Contributors, 
 
     player.startup();
     player.addEventListener("error", onError.bind(this));
+    player.addEventListener("metricChanged", metricChanged.bind(this));
 
     player.attachView(video);
     player.setAutoPlay(true);
@@ -440,7 +525,6 @@ app.controller('DashController', function($scope, Sources, Notes, Contributors, 
 
     $scope.doLoad = function () {
         player.attachSource($scope.selectedItem.url);
-        setTimeout(update, updateInterval);
     }
 
     $scope.hasLogo = function (item) {

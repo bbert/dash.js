@@ -16,7 +16,8 @@ MediaPlayer.dependencies.ManifestUpdater = function () {
 
     var refreshDelay = NaN,
         refreshTimer = null,
-        onRefreshTimer = null,
+        isStopped = false,
+        deferredUpdate,
 
         clear = function () {
             if (refreshTimer !== null) {
@@ -30,46 +31,65 @@ MediaPlayer.dependencies.ManifestUpdater = function () {
 
             if (!isNaN(refreshDelay)) {
                 this.debug.log("Refresh manifest in " + refreshDelay + " seconds.");
-                refreshTimer = setInterval(onRefreshTimer.bind(this), refreshDelay * 1000, this);
+                refreshTimer = setTimeout(onRefreshTimer.bind(this), Math.min(refreshDelay * 1000, Math.pow(2, 31) - 1), this);
             }
         },
 
         update = function () {
             var self = this,
-                manifest = self.manifestModel.getValue();
+                manifest = self.manifestModel.getValue(),
+                timeSinceLastUpdate;
 
             if (manifest !== undefined && manifest !== null) {
                 self.manifestExt.getRefreshDelay(manifest).then(
                     function (t) {
-                        refreshDelay = t;
+                        timeSinceLastUpdate = (new Date().getTime() - manifest.mpdLoadedTime.getTime()) / 1000;
+                        refreshDelay = Math.max(t - timeSinceLastUpdate, 0);
                         start.call(self);
                     }
                 );
             }
-        };
+        },
 
-    onRefreshTimer = function () {
-        var self = this,
-            manifest = self.manifestModel.getValue();
+        onRefreshTimer = function () {
+            var self = this,
+                manifest,
+                url;
 
-        var url = manifest.mpdUrl;
+            // The manifest should not update until the previous update has completed. A promise postpones the update
+            // until is is resolved. For the first time the promise does not exist yet, so pass 'true' instead.
+            Q.when(deferredUpdate ? deferredUpdate.promise : true).then(
+                function() {
+                    deferredUpdate = Q.defer();
+                    manifest = self.manifestModel.getValue();
+                    url = manifest.mpdUrl;
 
-        if (manifest.hasOwnProperty("Location")) {
-            url = manifest.Location;
-        }
+                    if (manifest.hasOwnProperty("Location")) {
+                        url = manifest.Location;
+                    }
 
-        self.debug.log("Refresh manifest @ " + url);
+                    //self.debug.log("Refresh manifest @ " + url);
 
-        self.manifestLoader.load(url).then(
-            function (manifestResult) {
-                self.manifestModel.setValue(manifestResult);
-                self.debug.log("Manifest has been refreshed.");
-                self.debug.log(manifestResult);
-                update.call(self);
-                self.system.notify("manifestUpdated");
+                    self.manifestLoader.load(url).then(
+                        function (manifestResult) {
+                            self.manifestModel.setValue(manifestResult);
+                            self.debug.log("Manifest has been refreshed.");
+                            //self.debug.log(manifestResult);
+                            if (isStopped) return;
+
+                            update.call(self);
+                        }
+                    );
+                }
+            );
+        },
+
+        onStreamsComposed = function() {
+            // When streams are ready we can consider manifest update completed. Resolve the update promise.
+            if (deferredUpdate) {
+                deferredUpdate.resolve();
             }
-        );
-    };
+        };
 
     return {
         debug: undefined,
@@ -80,10 +100,18 @@ MediaPlayer.dependencies.ManifestUpdater = function () {
 
         setup: function () {
             update.call(this);
+            // Listen to streamsComposed event to be aware that the streams have been composed
+            this.system.mapHandler("streamsComposed", undefined, onStreamsComposed.bind(this));
         },
 
-        init: function () {
+        start: function () {
+            isStopped = false;
             update.call(this);
+        },
+
+        stop: function() {
+            isStopped = true;
+            clear.call(this);
         }
     };
 };
